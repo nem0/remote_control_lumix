@@ -12,7 +12,7 @@ This plugin adds a simple TCP-based remote control interface to the Lumix Editor
   - `logError "message"` — writes the message to the editor log as an error.
   - `runLua "code"` — executes Lua code in the engine's Lua state. Use `\\\"` for escaped quotes and `\\\\` for escaped backslashes within the code string.
 
-The implementation is in [plugins/remote_control/src/editor/remote_control_plugins.cpp](plugins/remote_control/src/editor/remote_control_plugins.cpp).
+The implementation is in [src/editor/remote_control_plugins.cpp](src/editor/remote_control_plugins.cpp).
 
 **Usage**
 - Start the editor (the plugin starts automatically when loaded).
