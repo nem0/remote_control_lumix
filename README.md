@@ -15,6 +15,7 @@ This plugin adds a simple TCP-based remote control interface to the Lumix Editor
 The implementation is in [src/editor/remote_control_plugins.cpp](src/editor/remote_control_plugins.cpp).
 
 **Usage**
+- Download and compile the plugin [as any](../../docs/plugins.md) other [plugin](https://nem0.github.io/LumixEngine/plugins.html).
 - Start the editor (the plugin starts automatically when loaded).
 - From another process on the same machine connect to `127.0.0.1:17123` and send commands:
   ```
