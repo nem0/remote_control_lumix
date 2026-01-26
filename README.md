@@ -4,33 +4,28 @@ This plugin adds a simple TCP-based remote control interface to the Lumix Editor
 
 **Overview**
 - The plugin starts a background TCP listener on `127.0.0.1:17123` when the editor loads the plugin.
-- It accepts text-based commands in the following format:
+- It accepts messages in the following binary format:
   ```
-  <command> "<argument>"
+  <length> <lua_code>
   ```
-- Supported commands:
-  - `logError "message"` — writes the message to the editor log as an error.
-  - `runLua "code"` — executes Lua code in the engine's Lua state. Use `\\\"` for escaped quotes and `\\\\` for escaped backslashes within the code string.
+  Where `<length>` is an ASCII decimal number, followed by a space, followed by exactly that many bytes of Lua code.
+- The Lua code is executed in the engine's Lua state.
 
 The implementation is in [src/editor/remote_control_plugins.cpp](src/editor/remote_control_plugins.cpp).
 
 **Usage**
 - Download and compile the plugin [as any](../../docs/plugins.md) other [plugin](https://nem0.github.io/LumixEngine/plugins.html).
 - Start the editor (the plugin starts automatically when loaded).
-- From another process on the same machine connect to `127.0.0.1:17123` and send commands:
+- From another process on the same machine connect to `127.0.0.1:17123` and send a message:
   ```
-  logError "Hello world"
-  ```
-  ```
-  runLua "LumixAPI.logError(\"Hello from Lua\")"
+  24 LumixAPI.logError("Hi")
   ```
 
 **Included helpers**
-- `send_log_error.bat` — sends a `logError` message to the running editor:
+- `send_log_error.bat` — sends a Lua `logError` call to the running editor:
   ```
   send_log_error.bat "Hello from batch"
   ```
-
 
 - You can use any tool that can send TCP data (e.g., PowerShell, Python, netcat) to send commands.
 - You can ask AI to send the message.
