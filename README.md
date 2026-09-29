@@ -41,6 +41,12 @@ To queue a screenshot of Studio's scene view:
 
 The path must be project-relative, end in `.tga`, and have an existing parent directory. The tool returns `structuredContent.path` and `queued: true`; the GPU readback and file write happen asynchronously, so check Studio logs for failures. This captures the scene view, not the entire Studio window.
 
+To queue a screenshot of the **game view** (the in-game UI included), use `make_game_screenshot` with the same `.tga` path rules. The Game View window must be visible (or merged with the scene view) so it has a size; the tool reports an error otherwise:
+
+```json
+{"name":"make_game_screenshot","arguments":{"path":"screenshots/game.tga"}}
+```
+
 `create_entity`:
 
 ```json

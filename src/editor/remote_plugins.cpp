@@ -17,6 +17,9 @@
 #include "engine/reflection.h"
 #include "evox/evox_module.h"
 #include "renderer/editor/scene_view.h"
+#include <imgui/imgui.h>
+#include <imgui/IconsFontAwesome5.h>
+#include "renderer/editor/game_view.h"
 #include "core/allocator.h"
 #include "core/path.h"
 #include "core/string.h"
@@ -250,6 +253,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 				"{\"name\":\"new_world\",\"description\":\"Create a new world in Studio. If the current world has unsaved changes, Studio asks for confirmation instead.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"save_world\",\"description\":\"Save all named world partitions. For a new unnamed world, provide a .unv path relative to the project.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}},"
 				"{\"name\":\"make_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's scene view to a project-relative path. The file is written asynchronously.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
+				"{\"name\":\"make_game_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's game view (in-game UI included) to a project-relative path. The game view window must be visible; the file is written asynchronously.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
 				"{\"name\":\"load_world\",\"description\":\"Load a project-relative .unv world. Set additive to true to load it as another partition; otherwise replace the current world (Studio prompts if there are unsaved changes).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"additive\":{\"type\":\"boolean\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
 				"{\"name\":\"list_assets\",\"description\":\"List indexed project assets, sorted by path, with optional path prefix and pagination.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prefix\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"additionalProperties\":false}},"
 				"{\"name\":\"add_component\",\"description\":\"Add a reflected component to an entity.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"entity_id\":{\"type\":\"integer\"},\"component\":{\"type\":\"string\"}},\"required\":[\"entity_id\",\"component\"],\"additionalProperties\":false}},"
@@ -258,7 +262,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 		}
 		else if (method == "tools/call") {
 			const std::string tool = fieldString(msg, "name");
-			if (tool != "create_entity" && tool != "new_world" && tool != "save_world" && tool != "make_screenshot" && tool != "load_world" && tool != "evox_execute" && tool != "add_component" && tool != "set_property" && tool != "list_assets") { error(id, -32602, "Unknown tool"); return; }
+			if (tool != "create_entity" && tool != "new_world" && tool != "save_world" && tool != "make_screenshot" && tool != "make_game_screenshot" && tool != "load_world" && tool != "evox_execute" && tool != "add_component" && tool != "set_property" && tool != "list_assets") { error(id, -32602, "Unknown tool"); return; }
 			if (tool == "list_assets") {
 				const size_t args_pos = msg.find("\"arguments\"");
 				const std::string args = args_pos == std::string::npos ? "" : msg.substr(args_pos);
@@ -327,6 +331,25 @@ struct RemoteControl final : StudioApp::IPlugin {
 				view->makeScreenshot(StringView(path.c_str(), path.size()));
 				const std::string payload = "{\"path\":" + jsonString(path) + ",\"queued\":true}";
 				send("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":" + jsonString("Screenshot queued: " + path + " (check Studio logs for write errors)") + "}],\"structuredContent\":" + payload + "}}");
+				return;
+			}
+			if (tool == "make_game_screenshot") {
+				const size_t args_pos = msg.find("\"arguments\"");
+				const std::string args = args_pos == std::string::npos ? "" : msg.substr(args_pos);
+				const std::string path = fieldString(args, "path");
+				if (path.size() < 5 || path.size() >= MAX_PATH || path.compare(path.size() - 4, 4, ".tga") != 0
+					|| path[0] == '/' || path[0] == '\\' || path.find(':') != std::string::npos
+					|| path.find('\\') != std::string::npos || path.find("..") != std::string::npos) {
+					error(id, -32602, "Expected a project-relative .tga path without traversal"); return;
+				}
+				auto* plugin = app.getGUIPlugin("game_view");
+				if (!plugin) { error(id, -32000, "Game view unavailable"); return; }
+				auto* view = static_cast<GameView*>(plugin);
+				if (!view->makeScreenshot(StringView(path.c_str(), path.size()))) {
+					error(id, -32000, "Game view has no renderable size (open the Game View window, or enable merging it with the scene view)"); return;
+				}
+				const std::string payload = "{\"path\":" + jsonString(path) + ",\"queued\":true}";
+				send("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":" + jsonString("Game view screenshot queued: " + path + " (check Studio logs for write errors)") + "}],\"structuredContent\":" + payload + "}}");
 				return;
 			}
 			World* world = app.getWorldEditor().getWorld();
