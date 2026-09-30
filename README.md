@@ -2,7 +2,7 @@
 
 This plugin hosts an experimental MCP server **inside a running Lumix Studio instance** on Windows. It listens on `http://127.0.0.1:17123/mcp` using Streamable HTTP (POST requests, sessionless). Configure an MCP client that supports HTTP servers with that URL; there is no separate bridge process or stdin/stdout connection.
 
-The server exposes `new_world`, `save_world`, `load_world`, `make_screenshot`, `create_entity`, `list_assets`, `add_component`, `set_property`, and `evox_execute`. To create a new world:
+The server exposes `new_world`, `save_world`, `load_world`, `start_game`, `stop_game`, `send_input`, `make_screenshot`, `make_game_screenshot`, `create_entity`, `list_assets`, `add_component`, `set_property`, and `evox_execute`. To create a new world:
 
 ```json
 {"name":"new_world","arguments":{}}
@@ -46,6 +46,36 @@ To queue a screenshot of the **game view** (the in-game UI included), use `make_
 ```json
 {"name":"make_game_screenshot","arguments":{"path":"screenshots/game.tga"}}
 ```
+
+To enter and leave game mode (the same as Studio's Game Mode toggle):
+
+```json
+{"name":"start_game","arguments":{}}
+{"name":"stop_game","arguments":{}}
+```
+
+`start_game` starts the game immediately; `stop_game` is applied on Studio's next frame and restores the world to its state before the game started. Both are idempotent: `structuredContent.game_mode` is the requested state and `changed` tells whether the call actually switched modes. Starting is refused while a world is loading. Combine them with `make_game_screenshot` to check a running game.
+
+To drive a running game, inject input with `send_input` (game mode only). Events go straight into the engine's input system, so game scripts and in-game UI see them like real devices; the OS cursor and the Game View's mouse capture are not involved:
+
+```json
+{"name":"send_input","arguments":{"type":"key","key":"SPACE"}}
+{"name":"send_input","arguments":{"type":"key","key":"W","down":true}}
+{"name":"send_input","arguments":{"type":"key","key":"W","down":false}}
+{"name":"send_input","arguments":{"type":"text","text":"hello"}}
+{"name":"send_input","arguments":{"type":"mouse_move","x":640,"y":360}}
+{"name":"send_input","arguments":{"type":"mouse_move","dx":25,"dy":-10}}
+{"name":"send_input","arguments":{"type":"mouse_button","button":"left","x":120,"y":95}}
+{"name":"send_input","arguments":{"type":"mouse_button","button":"right","down":true}}
+{"name":"send_input","arguments":{"type":"mouse_wheel","amount":-3}}
+```
+
+- `key`: a letter, a digit, a name (`SPACE`, `TAB`, `RETURN`, `ESCAPE`, `SHIFT`, `CTRL`, `ALT`, `BACKSPACE`, `DELETE`, arrows, `PAGEUP`, `PAGEDOWN`, `HOME`, `END`, `F1`..`F24`) or a numeric virtual key code. Without `down` it is a tap: down now, up one frame later. With `down` it is that single transition, so hold a key by sending `true` and later `false`.
+- `mouse_move`: `x`, `y` are pixels in the game view (the same pixels as a `make_game_screenshot` image); `dx` / `dy` move relative to the last injected position. The plugin keeps its own cursor position, starting at 0, 0, and returns it in `structuredContent.mouse`.
+- `mouse_button`: with `x`, `y` the cursor moves there first and the button follows a frame later; without `down` it is a click (down, then up a frame later), with `down` a single press or release for drags.
+- `mouse_wheel`: `amount` in wheel steps, positive away from the user.
+
+Events still waiting for their frame are dropped when the game stops. Nothing releases keys for you: a key or button left down stays down until you send the release.
 
 `create_entity`:
 
