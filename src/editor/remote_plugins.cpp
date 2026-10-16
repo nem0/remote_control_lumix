@@ -431,6 +431,21 @@ struct RemoteControl final : StudioApp::IPlugin {
 	// send_input spreads a click or a key tap over consecutive frames (move, down, up), the way a real device delivers them.
 	struct PendingInput { i32 frames; InputSystem::Event event; };
 	Array<PendingInput> pending_input;
+	// make_game_screenshot without a size waits these frames before capturing: right after a camera jump or scene change TAA/FSR3 have not
+	// resolved yet and the capture shows the raw dither and jitter. The reply is held back until the file is written (the TCP thread handles
+	// one request at a time, it blocks on `done` until then).
+	static constexpr i32 SCREENSHOT_DELAY_FRAMES = 16;
+	static constexpr i32 SCREENSHOT_WRITE_TIMEOUT_FRAMES = 600;
+	struct DeferredScreenshot {
+		explicit DeferredScreenshot(IAllocator& allocator) : id(allocator) {}
+		bool active = false;
+		bool captured = false;
+		i32 frames = 0;
+		size_t last_size = 0;
+		u64 old_modified = 0;
+		StaticString<MAX_PATH> path;
+		String id;
+	} shot;
 	float mouse_x = 0;
 	float mouse_y = 0;
 
@@ -439,6 +454,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 		, pending(app.getAllocator())
 		, response(app.getAllocator())
 		, pending_input(app.getAllocator())
+		, shot(app.getAllocator())
 	{
 #ifdef _WIN32
 		network_initialized = os::initNetwork();
@@ -483,6 +499,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 				pending_input.erase(i);
 			}
 		}
+		updateScreenshot();
 		String request(app.getAllocator());
 		mutex.enter();
 		if (has_pending) { request = static_cast<String&&>(pending); has_pending = false; }
@@ -490,6 +507,48 @@ struct RemoteControl final : StudioApp::IPlugin {
 		if (request.length() == 0) return;
 		response.clear();
 		handle(request);
+		if (shot.active) return;	// the reply comes from `finishScreenshot`
+		done.signal();
+	}
+
+	void updateScreenshot() {
+		if (!shot.active) return;
+		auto* view = static_cast<GameView*>(app.getGUIPlugin("game_view"));
+		if (!view) { finishScreenshot(false, "Game view unavailable"); return; }
+		if (!shot.captured) {
+			if (--shot.frames > 0) return;
+			const Path absolute(app.getProjectDir(), shot.path);
+			shot.old_modified = os::getLastModified(StringView(absolute.c_str()));
+			if (!view->makeScreenshot(StringView(shot.path))) { finishScreenshot(false, "Game view screenshot failed"); return; }
+			shot.captured = true;
+			shot.frames = SCREENSHOT_WRITE_TIMEOUT_FRAMES;
+			shot.last_size = 0;
+			return;
+		}
+		// the TGA is written after the GPU read-back: done once the file is new and its size stopped changing
+		const Path absolute(app.getProjectDir(), shot.path);
+		const size_t size = os::getFileSize(StringView(absolute.c_str()));
+		const bool is_new = os::getLastModified(StringView(absolute.c_str())) != shot.old_modified;
+		if (is_new && size > 18 && size == shot.last_size) { finishScreenshot(true, ""); return; }
+		shot.last_size = size;
+		if (--shot.frames <= 0) finishScreenshot(false, "Timed out waiting for the screenshot file");
+	}
+
+	void finishScreenshot(bool ok, const char* message) {
+		response.clear();
+		if (ok) {
+			OutputMemoryStream payload(app.getAllocator());
+			payload << "{\"path\":";
+			writeJSONString(payload, StringView(shot.path));
+			payload << ",\"saved\":true}";
+			const StaticString<MAX_PATH + 64> text("Game view screenshot saved: ", shot.path);
+			reply(shot.id, text, toView(payload));
+		}
+		else {
+			error(shot.id, -32000, message);
+		}
+		shot.active = false;
+		shot.captured = false;
 		done.signal();
 	}
 
@@ -523,7 +582,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 				"{\"name\":\"new_world\",\"description\":\"Create a new world in Studio. If the current world has unsaved changes, Studio asks for confirmation instead.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"save_world\",\"description\":\"Save all named world partitions. For a new unnamed world, provide a .unv path relative to the project.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}},"
 				"{\"name\":\"make_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's scene view to a project-relative path. The file is written asynchronously.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
-				"{\"name\":\"make_game_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's game view (in-game UI included) to a project-relative path. The game view window must be visible unless width and height are given; the file is written asynchronously. Optional width and height (both, in pixels) render this capture at that size instead of the window size.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"width\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":8192},\"height\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":8192}},\"required\":[\"path\"],\"additionalProperties\":false}},"
+				"{\"name\":\"make_game_screenshot\",\"description\":\"Take a TGA screenshot of Studio's game view (in-game UI included) at its current render size and save it to a project-relative path. The capture is taken 16 frames after the call so temporal AA can resolve, and the reply comes once the file is written. The game view window must be visible, or its size forced.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
 				"{\"name\":\"start_game\",\"description\":\"Enter game mode in Studio (the same as the Game Mode toggle). Does nothing if the game is already running.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"stop_game\",\"description\":\"Leave game mode in Studio; the world is restored to its state before the game started. Takes effect on Studio's next frame.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"invoke_action\",\"description\":\"Request a Studio action (menu item or shortcut) by its internal name, e.g. videorec_record. The action runs on Studio's next frame.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}},"
@@ -600,14 +659,15 @@ struct RemoteControl final : StudioApp::IPlugin {
 					auto* plugin = app.getGUIPlugin("game_view");
 					if (!plugin) { error(id, -32000, "Game view unavailable"); return; }
 					auto* view = static_cast<GameView*>(plugin);
-					double width = 0, height = 0;
-						const bool has_width = parseNumber(fieldValue(args, "width"), width);
-						const bool has_height = parseNumber(fieldValue(args, "height"), height);
-						if (has_width != has_height) { error(id, -32602, "width and height must be given together"); return; }
-						if (has_width && (width < 1 || height < 1 || width > 8192 || height > 8192)) { error(id, -32602, "width and height must be between 1 and 8192"); return; }
-						if (!view->makeScreenshot(path, (int)width, (int)height)) {
-						error(id, -32000, "Game view has no renderable size (open the Game View window, or enable merging it with the scene view)"); return;
-					}
+					const IVec2 size = view->getPipeline() ? view->getPipeline()->getDisplaySize() : IVec2(0);
+					if (size.x <= 0 || size.y <= 0) { error(id, -32000, "Game view has no renderable size (open the Game View window, or enable merging it with the scene view)"); return; }
+					if (shot.active) { error(id, -32000, "A game view screenshot is already in progress"); return; }
+					shot.active = true;
+					shot.captured = false;
+					shot.frames = SCREENSHOT_DELAY_FRAMES;
+					shot.path = StaticString<MAX_PATH>(path.c_str());
+					shot.id = String(id, allocator);
+					return;	// replied by `finishScreenshot` once the file is written
 				}
 				else {
 					auto* plugin = app.getGUIPlugin("scene_view");
