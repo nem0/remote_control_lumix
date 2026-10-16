@@ -1,4 +1,5 @@
 #include "editor/studio_app.h"
+#include "editor/action.h"
 #include "editor/asset_compiler.h"
 #include "editor/asset_browser.h"
 #include "editor/world_editor.h"
@@ -9,6 +10,7 @@
 #include "engine/world.h"
 #include "engine/reflection.h"
 #include "evox/evox_module.h"
+#include "evox/../../external/evox/arena.h"
 #include "renderer/editor/scene_view.h"
 #include <imgui/IconsFontAwesome5.h>
 #include "renderer/editor/game_view.h"
@@ -303,6 +305,109 @@ struct SetPropertyVisitor final : reflection::IEmptyPropertyVisitor {
 };
 
 // In-process, sessionless MCP over Streamable HTTP, bound to loopback only.
+// Compiles `source` into a runtime of its own (its globals are not the game's) and runs its main(world : World).
+struct EvoxRun {
+	struct Imports {
+		FileSystem& filesystem;
+		IAllocator& allocator;
+		Array<OutputMemoryStream> sources;
+	};
+
+	static void print(void* userdata, ex_string_view msg) {
+		static_cast<String*>(userdata)->append(StringView(msg.begin, (u64)msg.length));
+	}
+
+	static int resolveImport(void* userdata, ex_string_view path, ex_string_view, ex_string_view* source) {
+		Imports& imports = *(Imports*)userdata;
+		const StringView requested(path.begin, (u64)path.length);
+		Path file_path;
+		if (startsWith(requested, "core:")) {
+			const StringView name = requested.withoutLeft(5);
+			file_path = endsWith(name, ".evox") ? Path("engine/scripts/core/", name) : Path("engine/scripts/core/", name, ".evox");
+		}
+		else {
+			file_path = endsWith(requested, ".evox") ? Path(requested) : Path(requested, ".evox");
+		}
+		OutputMemoryStream& blob = imports.sources.emplace(imports.allocator);
+		if (!imports.filesystem.getContentSync(file_path, blob)) {
+			imports.sources.pop();
+			return 0;
+		}
+		*source = {(const char*)blob.data(), (i64)blob.size()};
+		return 1;
+	}
+
+	static ex_native_fn resolveNative(ex_runtime*, ex_native_function_desc function, void* userdata) {
+		return static_cast<EvoxSystem*>(userdata)->getNativeFunction(StringView(function.unit_path.begin, (u64)function.unit_path.length), StringView(function.name.begin, (u64)function.name.length));
+	}
+
+	static bool execute(EvoxSystem& evox, StringView source, World& world, String& output) {
+		// Keep every object alive until the task finishes: bytecode owns types, runtime owns globals.
+		ex_host host = {};
+		host.diagnostics_userdata = &output;
+		host.print = &print;
+		ex_default_arena_create(&host.arena);
+		ex_module* module = ex_module_create(&host);
+		ex_bytecode* bytecode = nullptr;
+		ex_runtime* runtime = nullptr;
+		ex_task* task = nullptr;
+		bool success = false;
+		if (!module) {
+			output.append("Could not create Evox module");
+			goto cleanup;
+		}
+		{
+			Imports imports{evox.getEngine().getFileSystem(), evox.getEngine().getAllocator(), Array<OutputMemoryStream>(evox.getEngine().getAllocator())};
+			if (!ex_module_compile(module, {source.data, (i64)source.size()}, {"<mcp>", 5}, &resolveImport, &imports)) {
+				if (output.length() == 0) output.append("Evox compilation failed");
+				goto cleanup;
+			}
+		}
+		{
+			ex_bytecode_compile_options options = { true };
+			bytecode = ex_bytecode_compile(module, &host, &options);
+		}
+		if (!bytecode) {
+			if (output.length() == 0) output.append("Evox bytecode compilation failed");
+			goto cleanup;
+		}
+		host.native_resolver = &resolveNative;
+		host.native_resolver_userdata = &evox;
+		runtime = ex_runtime_create(bytecode, &host);
+		if (!runtime) {
+			output.append("Could not initialize Evox runtime");
+			goto cleanup;
+		}
+		task = ex_task_create(runtime);
+		if (!task) {
+			output.append("Could not create Evox task");
+			goto cleanup;
+		}
+		{
+			// The Evox World handle is a native World* (same ABI as the regular main call).
+			World* arg = &world;
+			const ex_call_result result = ex_call(task, {"main", 4}, &arg, sizeof(arg));
+			if (result != EX_CALL_RESULT_OK) {
+				output.append("Evox main failed (result ", (const char*)StaticString<32>((i32)result), ")");
+				for (u32 i = 0, count = ex_debug_stack_depth(task); i < count; ++i) {
+					ex_debug_location loc = {};
+					if (ex_debug_frame_location(task, i, &loc) != EX_RESULT_OK) continue;
+					output.append("\n  at ", StringView(loc.source_name.begin, (u64)loc.source_name.length), ":", (const char*)StaticString<32>(loc.line + 1));
+				}
+				goto cleanup;
+			}
+		}
+		success = true;
+	cleanup:
+		if (task) ex_task_destroy(task);
+		if (runtime) ex_runtime_destroy(runtime);
+		if (bytecode) ex_bytecode_destroy(bytecode);
+		if (module) ex_module_destroy(module);
+		ex_default_arena_destroy(&host.arena);
+		return success;
+	}
+};
+
 struct RemoteControl final : StudioApp::IPlugin {
 	static constexpr u32 MAX_MESSAGE = 1024 * 1024;
 	static constexpr u32 MAX_HEADERS = 8192;
@@ -418,19 +523,20 @@ struct RemoteControl final : StudioApp::IPlugin {
 				"{\"name\":\"new_world\",\"description\":\"Create a new world in Studio. If the current world has unsaved changes, Studio asks for confirmation instead.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"save_world\",\"description\":\"Save all named world partitions. For a new unnamed world, provide a .unv path relative to the project.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}},"
 				"{\"name\":\"make_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's scene view to a project-relative path. The file is written asynchronously.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
-				"{\"name\":\"make_game_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's game view (in-game UI included) to a project-relative path. The game view window must be visible; the file is written asynchronously.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
+				"{\"name\":\"make_game_screenshot\",\"description\":\"Queue a TGA screenshot of Studio's game view (in-game UI included) to a project-relative path. The game view window must be visible unless width and height are given; the file is written asynchronously. Optional width and height (both, in pixels) render this capture at that size instead of the window size.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"width\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":8192},\"height\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":8192}},\"required\":[\"path\"],\"additionalProperties\":false}},"
 				"{\"name\":\"start_game\",\"description\":\"Enter game mode in Studio (the same as the Game Mode toggle). Does nothing if the game is already running.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
 				"{\"name\":\"stop_game\",\"description\":\"Leave game mode in Studio; the world is restored to its state before the game started. Takes effect on Studio's next frame.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},"
+				"{\"name\":\"invoke_action\",\"description\":\"Request a Studio action (menu item or shortcut) by its internal name, e.g. videorec_record. The action runs on Studio's next frame.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}},"
 				"{\"name\":\"send_input\",\"description\":\"Inject keyboard or mouse input into the running game (game mode only). type: key (key, optional down; without down it is a tap), text (text), mouse_move (x, y in game view pixels, or dx, dy), mouse_button (button left|right|middle, optional x, y, optional down; without down it is a click), mouse_wheel (amount).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"key\",\"text\",\"mouse_move\",\"mouse_button\",\"mouse_wheel\"]},\"key\":{\"type\":\"string\"},\"down\":{\"type\":\"boolean\"},\"text\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"dx\":{\"type\":\"number\"},\"dy\":{\"type\":\"number\"},\"button\":{\"type\":\"string\",\"enum\":[\"left\",\"right\",\"middle\"]},\"amount\":{\"type\":\"number\"}},\"required\":[\"type\"],\"additionalProperties\":false}},"
 				"{\"name\":\"load_world\",\"description\":\"Load a project-relative .unv world. Set additive to true to load it as another partition; otherwise replace the current world (Studio prompts if there are unsaved changes).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"additive\":{\"type\":\"boolean\"}},\"required\":[\"path\"],\"additionalProperties\":false}},"
 				"{\"name\":\"list_assets\",\"description\":\"List indexed project assets, sorted by path, with optional path prefix and pagination.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prefix\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"additionalProperties\":false}},"
 				"{\"name\":\"add_component\",\"description\":\"Add a reflected component to an entity.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"entity_id\":{\"type\":\"integer\"},\"component\":{\"type\":\"string\"}},\"required\":[\"entity_id\",\"component\"],\"additionalProperties\":false}},"
 				"{\"name\":\"set_property\",\"description\":\"Set a top-level reflected component property; vectors are numeric arrays.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"entity_id\":{\"type\":\"integer\"},\"component\":{\"type\":\"string\"},\"property\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"entity_id\",\"component\",\"property\",\"value\"],\"additionalProperties\":false}},"
-				"{\"name\":\"evox_execute\",\"description\":\"Compile and execute Evox source in a fresh runtime against the current world. Source must define fn main(world : World) : void.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"}},\"required\":[\"code\"],\"additionalProperties\":false}}]}}";
+				"{\"name\":\"evox_execute\",\"description\":\"Execute Evox against the current world. runtime \\\"own\\\" (default) compiles code in a fresh runtime of its own, its globals are not the game's; the source must define fn main(world : World) : void. runtime \\\"game\\\" calls function(world : World) of unit (an import path such as scripts/hud that is part of main.evox) on the running game runtime and shares its globals; it takes no code.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"runtime\":{\"type\":\"string\",\"enum\":[\"own\",\"game\"]},\"unit\":{\"type\":\"string\"},\"function\":{\"type\":\"string\"}},\"additionalProperties\":false}}]}}";
 		}
 		else if (method == "tools/call") {
 			const String tool = fieldString(msg, "name", allocator);
-			if (tool != "create_entity" && tool != "new_world" && tool != "save_world" && tool != "make_screenshot" && tool != "make_game_screenshot" && tool != "start_game" && tool != "stop_game" && tool != "send_input" && tool != "load_world" && tool != "evox_execute" && tool != "add_component" && tool != "set_property" && tool != "list_assets") { error(id, -32602, "Unknown tool"); return; }
+			if (tool != "create_entity" && tool != "new_world" && tool != "save_world" && tool != "make_screenshot" && tool != "make_game_screenshot" && tool != "start_game" && tool != "stop_game" && tool != "invoke_action" && tool != "send_input" && tool != "load_world" && tool != "evox_execute" && tool != "add_component" && tool != "set_property" && tool != "list_assets") { error(id, -32602, "Unknown tool"); return; }
 			// empty if the call has no arguments
 			const char* args_begin = find(msg, "\"arguments\"");
 			const StringView args = args_begin ? StringView(args_begin, msg.end()) : StringView();
@@ -494,7 +600,12 @@ struct RemoteControl final : StudioApp::IPlugin {
 					auto* plugin = app.getGUIPlugin("game_view");
 					if (!plugin) { error(id, -32000, "Game view unavailable"); return; }
 					auto* view = static_cast<GameView*>(plugin);
-					if (!view->makeScreenshot(path)) {
+					double width = 0, height = 0;
+						const bool has_width = parseNumber(fieldValue(args, "width"), width);
+						const bool has_height = parseNumber(fieldValue(args, "height"), height);
+						if (has_width != has_height) { error(id, -32602, "width and height must be given together"); return; }
+						if (has_width && (width < 1 || height < 1 || width > 8192 || height > 8192)) { error(id, -32602, "width and height must be between 1 and 8192"); return; }
+						if (!view->makeScreenshot(path, (int)width, (int)height)) {
 						error(id, -32000, "Game view has no renderable size (open the Game View window, or enable merging it with the scene view)"); return;
 					}
 				}
@@ -505,7 +616,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 					if (!view->getPipeline() || view->getPipeline()->getDisplaySize().x <= 0 || view->getPipeline()->getDisplaySize().y <= 0) {
 						error(id, -32000, "Scene view has no renderable size"); return;
 					}
-					view->makeScreenshot(path);
+					view->makeScreenshot(StringView(path));
 				}
 				OutputMemoryStream payload(allocator);
 				payload << "{\"path\":";
@@ -513,6 +624,18 @@ struct RemoteControl final : StudioApp::IPlugin {
 				payload << ",\"queued\":true}";
 				const StaticString<MAX_PATH + 96> text(is_game ? "Game view screenshot queued: " : "Screenshot queued: ", path.c_str(), " (check Studio logs for write errors)");
 				reply(id, text, toView(payload));
+				return;
+			}
+			if (tool == "invoke_action") {
+				const String action_name = fieldString(args, "name", allocator);
+				Action* action = action_name.length() > 0 ? app.getAction(action_name.c_str()) : nullptr;
+				if (!action) { error(id, -32602, "Unknown action"); return; }
+				action->request = true;
+				OutputMemoryStream payload(allocator);
+				payload << "{\"requested\":true,\"name\":";
+				writeJSONString(payload, action_name);
+				payload << "}";
+				reply(id, "Action requested", toView(payload));
 				return;
 			}
 			World* world = app.getWorldEditor().getWorld();
@@ -714,12 +837,58 @@ struct RemoteControl final : StudioApp::IPlugin {
 			}
 			if (tool == "evox_execute") {
 				if (args.empty()) { error(id, -32602, "Missing arguments"); return; }
-				const String code = fieldString(args, "code", allocator);
-				if (code.length() == 0 || code.length() > 256 * 1024) { error(id, -32602, "Code must be nonempty and at most 256 KB"); return; }
+				const String runtime = fieldString(args, "runtime", allocator);
+				const bool in_game = runtime == "game";
+				if (runtime.length() != 0 && !in_game && runtime != "own") { error(id, -32602, "runtime must be own or game"); return; }
 				auto* evox = static_cast<EvoxSystem*>(app.getEngine().getSystemManager().getSystem("evox_system"));
 				if (!evox) { error(id, -32000, "Evox system unavailable"); return; }
 				String output(allocator);
-				const bool ok = evox->executeSource(code, *world, output);
+				bool ok;
+				if (in_game) {
+					const String unit = fieldString(args, "unit", allocator);
+					const String function = fieldString(args, "function", allocator);
+					if (unit.length() == 0 || function.length() == 0) { error(id, -32602, "runtime game needs unit and function"); return; }
+					ex_runtime* game_runtime = evox->getRuntime();
+					const StaticString<MAX_PATH> unit_with_extension(unit, ".evox");
+					i32 index = -1;
+					if (game_runtime) {
+						index = ex_runtime_find_function(game_runtime, {unit.c_str(), (i64)unit.length()}, {function.c_str(), (i64)function.length()});
+						if (index < 0) index = ex_runtime_find_function(game_runtime, {unit_with_extension.data, (i64)stringLength(unit_with_extension.data)}, {function.c_str(), (i64)function.length()});
+					}
+					ok = false;
+					if (!game_runtime) output.append("The game runtime is not available");
+					else if (index < 0) {
+						output.append("Function ", unit.c_str(), ".", function.c_str(), " is not in the game runtime. Units:");
+						for (u32 i = 0, count = ex_debug_unit_count(game_runtime); i < count; ++i) {
+							const ex_string_view name = ex_debug_unit_source_name(game_runtime, i);
+							output.append("\n  ", StringView(name.begin, (u64)name.length));
+						}
+					}
+					else {
+						// a task of its own: the game's task is suspended in its frame loop, but tasks share the runtime's globals
+						ex_task* task = ex_task_create(game_runtime);
+						if (!task) output.append("Could not create Evox task");
+						else {
+							World* world_arg = world;
+							const ex_call_result result = ex_call_function(task, (u32)index, &world_arg, sizeof(world_arg));
+							ok = result == EX_CALL_RESULT_OK;
+							if (!ok) {
+								output.append("Evox call failed (result ", (const char*)StaticString<32>((i32)result), ")");
+								for (u32 i = 0, count = ex_debug_stack_depth(task); i < count; ++i) {
+									ex_debug_location location = {};
+									if (ex_debug_frame_location(task, i, &location) != EX_RESULT_OK) continue;
+									output.append("\n  at ", StringView(location.source_name.begin, (u64)location.source_name.length), ":", (const char*)StaticString<32>(location.line + 1));
+								}
+							}
+							ex_task_destroy(task);
+						}
+					}
+				}
+				else {
+					const String code = fieldString(args, "code", allocator);
+					if (code.length() == 0 || code.length() > 256 * 1024) { error(id, -32602, "Code must be nonempty and at most 256 KB"); return; }
+					ok = EvoxRun::execute(*evox, code, *world, output);
+				}
 				const StringView text = output.length() != 0 ? StringView(output) : StringView(ok ? "Evox execution completed" : "Evox execution failed");
 				response << "{\"jsonrpc\":\"2.0\",\"id\":" << id << ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":";
 				writeJSONString(response, text);
