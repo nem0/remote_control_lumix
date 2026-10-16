@@ -305,7 +305,7 @@ struct SetPropertyVisitor final : reflection::IEmptyPropertyVisitor {
 };
 
 // In-process, sessionless MCP over Streamable HTTP, bound to loopback only.
-// Compiles `source` into a runtime of its own (its globals are not the game's) and runs its main(world : World).
+// Compiles `source` into a runtime of its own (its globals are not the game's) and runs its main(world : World, app : StudioApp).
 struct EvoxRun {
 	struct Imports {
 		FileSystem& filesystem;
@@ -341,7 +341,7 @@ struct EvoxRun {
 		return static_cast<EvoxSystem*>(userdata)->getNativeFunction(StringView(function.unit_path.begin, (u64)function.unit_path.length), StringView(function.name.begin, (u64)function.name.length));
 	}
 
-	static bool execute(EvoxSystem& evox, StringView source, World& world, String& output) {
+	static bool execute(EvoxSystem& evox, StudioApp& app, StringView source, World& world, String& output) {
 		// Keep every object alive until the task finishes: bytecode owns types, runtime owns globals.
 		ex_host host = {};
 		host.diagnostics_userdata = &output;
@@ -384,9 +384,9 @@ struct EvoxRun {
 			goto cleanup;
 		}
 		{
-			// The Evox World handle is a native World* (same ABI as the regular main call).
-			World* arg = &world;
-			const ex_call_result result = ex_call(task, {"main", 4}, &arg, sizeof(arg));
+			// The Evox World and StudioApp handles are native pointers (same ABI as the regular main call), passed one after the other.
+			struct { World* world; StudioApp* app; } args = { &world, &app };
+			const ex_call_result result = ex_call(task, {"main", 4}, &args, sizeof(args));
 			if (result != EX_CALL_RESULT_OK) {
 				output.append("Evox main failed (result ", (const char*)StaticString<32>((i32)result), ")");
 				for (u32 i = 0, count = ex_debug_stack_depth(task); i < count; ++i) {
@@ -532,7 +532,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 				"{\"name\":\"list_assets\",\"description\":\"List indexed project assets, sorted by path, with optional path prefix and pagination.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prefix\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"additionalProperties\":false}},"
 				"{\"name\":\"add_component\",\"description\":\"Add a reflected component to an entity.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"entity_id\":{\"type\":\"integer\"},\"component\":{\"type\":\"string\"}},\"required\":[\"entity_id\",\"component\"],\"additionalProperties\":false}},"
 				"{\"name\":\"set_property\",\"description\":\"Set a top-level reflected component property; vectors are numeric arrays.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"entity_id\":{\"type\":\"integer\"},\"component\":{\"type\":\"string\"},\"property\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"entity_id\",\"component\",\"property\",\"value\"],\"additionalProperties\":false}},"
-				"{\"name\":\"evox_execute\",\"description\":\"Execute Evox against the current world. runtime \\\"own\\\" (default) compiles code in a fresh runtime of its own, its globals are not the game's; the source must define fn main(world : World) : void. runtime \\\"game\\\" calls function(world : World) of unit (an import path such as scripts/hud that is part of main.evox) on the running game runtime and shares its globals; it takes no code.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"runtime\":{\"type\":\"string\",\"enum\":[\"own\",\"game\"]},\"unit\":{\"type\":\"string\"},\"function\":{\"type\":\"string\"}},\"additionalProperties\":false}}]}}";
+				"{\"name\":\"evox_execute\",\"description\":\"Execute Evox against the current world. runtime \\\"own\\\" (default) compiles code in a fresh runtime of its own, its globals are not the game's; the source must define fn main(world : World, app : StudioApp) : void (import core:editor/studioapp). runtime \\\"game\\\" calls function(world : World) of unit (an import path such as scripts/hud that is part of main.evox) on the running game runtime and shares its globals; it takes no code.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"runtime\":{\"type\":\"string\",\"enum\":[\"own\",\"game\"]},\"unit\":{\"type\":\"string\"},\"function\":{\"type\":\"string\"}},\"additionalProperties\":false}}]}}";
 		}
 		else if (method == "tools/call") {
 			const String tool = fieldString(msg, "name", allocator);
@@ -887,7 +887,7 @@ struct RemoteControl final : StudioApp::IPlugin {
 				else {
 					const String code = fieldString(args, "code", allocator);
 					if (code.length() == 0 || code.length() > 256 * 1024) { error(id, -32602, "Code must be nonempty and at most 256 KB"); return; }
-					ok = EvoxRun::execute(*evox, code, *world, output);
+					ok = EvoxRun::execute(*evox, app, code, *world, output);
 				}
 				const StringView text = output.length() != 0 ? StringView(output) : StringView(ok ? "Evox execution completed" : "Evox execution failed");
 				response << "{\"jsonrpc\":\"2.0\",\"id\":" << id << ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":";

@@ -106,9 +106,9 @@ Component IDs and property names are case-sensitive reflection names (see `src/*
 To run a complete Evox source file in a temporary runtime against the active Studio world:
 
 ```json
-{"name":"evox_execute","arguments":{"code":"import \"core:world\"\nfn main(world : World) : void { world.createEntity(); }"}}
+{"name":"evox_execute","arguments":{"code":"import \"core:world\"\nimport \"core:editor/studioapp\"\nfn main(world : World, app : StudioApp) : void { world.createEntity(); }"}}
 ```
 
-The source must define `fn main(world : World) : void` and may import project and `core:` modules. Each request compiles in its own runtime (no shared script globals), but native Evox APIs can modify the active world. Compilation and execution failures return MCP `isError: true` with diagnostics. Scripts must finish without yielding; an infinite loop will block Studio, so use this only with trusted code.
+The source must define `fn main(world : World, app : StudioApp) : void` (with `import "core:editor/studioapp"`; `app` gives access to the editor, e.g. `app.getGameView()`) and may import project and `core:` modules. Each request compiles in its own runtime (no shared script globals), but native Evox APIs can modify the active world. Compilation and execution failures return MCP `isError: true` with diagnostics. Scripts must finish without yielding; an infinite loop will block Studio, so use this only with trusted code.
 
 The HTTP listener runs on a worker thread; tool execution runs on Studio's update thread. Requests are handled one at a time. The server implements MCP initialization, `tools/list`, and `tools/call`. Only POST `/mcp` is supported (GET returns 405), with one JSON-RPC message per request and a 1 MB request-body limit. It binds to loopback and checks Host/Origin, but has **no authentication**. The JSON parser and protocol surface are intentionally minimal; do not expose this port to untrusted users or networks.
